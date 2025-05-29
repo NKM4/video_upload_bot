@@ -1,4 +1,4 @@
-import os, aiofiles, asyncio, subprocess, requests, uuid, pathlib, shutil, collections, mimetypes
+import os, aiofiles, asyncio, subprocess, requests, uuid, pathlib, shutil, collections
 import discord
 from fastapi import FastAPI, UploadFile, Request, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse
@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 ERROR_WEBHOOK_URL = os.getenv("ERROR_WEBHOOK_URL")
 MAX_FILE_SIZE      = 9.9 * 1024 * 1024            # 9.9 MB
-MAX_RETRY_CRF      = [28, 31, 34, 37, 40]         # H.264 再圧縮用
-QUEUE              = collections.deque()          # ② 待機キュー
+MAX_RETRY_CRF      = [28, 31, 34, 37, 40]         # H.264 再圧縮
+QUEUE              = collections.deque()          # 待機キュー表示用
 
 class BotRef:
     def __init__(self):
@@ -20,75 +20,83 @@ class BotRef:
 
 bot_ref = BotRef()
 app     = FastAPI()
-tree: app_commands.CommandTree | None = None      # 遅延取得
+tree: app_commands.CommandTree | None = None
 
-# ────────────── ffmpeg ヘルパ ──────────────
-def _encode(src: str, dst: str, crf: int, codec: str = "libx264"):
-    """nice + ionice で CPU/I/O 優先度を下げて実行"""
-    subprocess.run(
-        ["nice", "-n", "10", "ionice", "-c2", "-n7",
-         "ffmpeg", "-y", "-i", src,
-         "-vcodec", codec, "-crf", str(crf), "-preset", "fast",
-         "-acodec", "aac", dst],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+# ───────── ffmpeg ラッパ ─────────
+def _encode(src: str, dst: str, crf: int, codec: str = "libx264", log_path: str | None = None):
+    """nice/ionice で低優先度、stderr をログファイルへ"""
+    with open(log_path or os.devnull, "wb") as logf:
+        subprocess.run(
+            ["nice","-n","10","ionice","-c2","-n7",
+             "ffmpeg","-hide_banner","-y","-i",src,
+             "-vcodec",codec,"-crf",str(crf),"-preset","fast",
+             "-acodec","aac",dst],
+            check=True, stdout=logf, stderr=subprocess.STDOUT
+        )
 
-async def encode_async(src: str, dst: str, crf: int, codec: str = "libx264"):
-    await asyncio.to_thread(_encode, src, dst, crf, codec)
+async def encode_async(src: str, dst: str, crf: int,
+                       codec: str = "libx264", log_path: str | None = None):
+    await asyncio.to_thread(_encode, src, dst, crf, codec, log_path)
 
-# ────────────── 1 タスク処理 ──────────────
+# ───────── 1タスク処理 ─────────
 async def process_video(workdir: pathlib.Path, ext: str,
                         channel_id: int | None, user_name: str | None):
-    output = workdir / "output.mp4"
-    inputf = workdir / f"input.{ext}"
+    output   = workdir / "output.mp4"
+    inputf   = workdir / f"input.{ext}"
+    logfile  = workdir / "error.log"
     try:
-        # 初回 H.264 エンコード
+        # 初回 H.264
         first_crf = 32 if ext == "mov" else 28
-        await encode_async(str(inputf), str(output), crf=first_crf)
+        await encode_async(str(inputf), str(output), first_crf,
+                           log_path=str(logfile))
 
-        # サイズ超過なら段階的に H.264 再圧縮
+        # 段階的再圧縮
         for crf in MAX_RETRY_CRF:
             if output.stat().st_size <= MAX_FILE_SIZE:
                 break
             tmp = output.with_suffix(".tmp.mp4")
-            await encode_async(str(output), str(tmp), crf=crf)
+            await encode_async(str(output), str(tmp), crf,
+                               log_path=str(logfile))
             shutil.move(tmp, output)
 
-        # まだ超過 → H.265 フォールバック
+        # H.265 フォールバック
         if output.stat().st_size > MAX_FILE_SIZE:
             tmp = output.with_suffix(".x265.mp4")
-            await encode_async(str(inputf), str(tmp), crf=28, codec="libx265")
+            await encode_async(str(inputf), str(tmp), 28, "libx265",
+                               log_path=str(logfile))
             if tmp.stat().st_size <= MAX_FILE_SIZE:
                 shutil.move(tmp, output)
             else:
                 raise Exception("H.265 でも 9.9 MB 以下に圧縮できませんでした")
 
-        # Discord 投稿（⑥ 3 回までリトライ）
+        # Discord 送信（3回リトライ）
         channel = bot_ref.bot.get_channel(channel_id) if channel_id else None
         if channel is None:
-            raise Exception("チャンネル取得に失敗しました")
+            raise Exception("チャンネル取得に失敗")
 
-        for attempt in range(3):
+        for i in range(3):
             try:
                 await channel.send(
                     f"{user_name or '不明ユーザー'} さんの動画です。",
                     file=discord.File(str(output))
                 )
                 break
-            except Exception as e:
-                if attempt == 2:
+            except Exception:
+                if i == 2:
                     raise
                 await asyncio.sleep(5)
 
     except Exception as e:
+        files = {"file": logfile.open("rb")} if logfile.exists() else None
         requests.post(ERROR_WEBHOOK_URL,
-                      json={"content": f"[動画投稿失敗] {e}"})
+                      json={"content": f"[動画投稿失敗] {e}"},
+                      files=files)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         if QUEUE and QUEUE[0] == workdir:
             QUEUE.popleft()
 
-# ────────────── Bot /vd コマンド ──────────────
+# ───────── Bot /vd ─────────
 @app.on_event("startup")
 async def startup_event():
     global tree
@@ -96,13 +104,12 @@ async def startup_event():
         await asyncio.sleep(0.1)
 
     tree = bot_ref.bot.tree
-    if "vd" not in [cmd.name for cmd in tree.walk_commands()]:
+    if "vd" not in [c.name for c in tree.walk_commands()]:
         @tree.command(name="vd", description="アップロード UI の URL を送信")
         async def send_url(interaction: discord.Interaction):
-            url = os.getenv("TUNNEL_URL", "URL未取得")
+            url = os.getenv("TUNNEL_URL","URL未取得")
             await interaction.response.send_message(
-                f"アップロードはこちら → {url}\n"
-                f"現在の待機キュー: {len(QUEUE)} 件",
+                f"アップロードはこちら → {url}\n現在待機キュー: {len(QUEUE)} 件",
                 ephemeral=True
             )
             bot_ref.last_channel_id = interaction.channel_id
@@ -111,14 +118,11 @@ async def startup_event():
     await bot_ref.bot.wait_until_ready()
     await tree.sync()
 
-# ────────────── アップロード受付 ──────────────
+# ───────── 受付 ─────────
 @app.post("/")
-async def upload_video(
-    request: Request,
-    file: UploadFile,
-    background_tasks: BackgroundTasks
-):
-    # ④ ファイル形式チェック
+async def upload_video(request: Request,
+                       file: UploadFile,
+                       background_tasks: BackgroundTasks):
     if not file.content_type or not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="動画ファイルを選択してください")
 
@@ -131,22 +135,21 @@ async def upload_video(
     async with aiofiles.open(temp_path, "wb") as f:
         await f.write(await file.read())
 
-    QUEUE.append(workdir)  # ② キューに登録
-    position = len(QUEUE)
+    QUEUE.append(workdir)
+    pos = len(QUEUE)
 
     background_tasks.add_task(
-        process_video,
-        workdir, ext,
+        process_video, workdir, ext,
         bot_ref.last_channel_id, bot_ref.last_user_name
     )
 
     return HTMLResponse(
-        f"アップロードを受け付けました！（現在待機 {position-1} 件）<br>"
+        f"アップロードを受け付けました！（待機 {pos-1} 件）<br>"
         "数分以内に Discord に投稿されます。",
         status_code=202
     )
 
-# ────────────── シンプル UI ──────────────
+# ───────── フォーム ─────────
 @app.get("/", response_class=HTMLResponse)
 async def get_form():
     return """
