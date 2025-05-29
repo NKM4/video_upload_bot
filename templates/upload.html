@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>動画アップロード</title>
+</head>
+<body>
+  <h2>{{ user }} さん、動画をアップしてください</h2>
+  <form method="post" enctype="multipart/form-data">
+    <input type="file" name="file" accept="video/*" required><br><br>
+    <input type="submit" value="アップロード">
+  </form>
+</body>
+</html>

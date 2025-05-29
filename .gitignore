@@ -1,0 +1,14 @@
+# 秘密情報
+.env
+
+# Python ビルド
+__pycache__/
+*.pyc
+
+# アップロード一時ファイル
+static/
+uploads/
+
+# OS・エディタ系
+.DS_Store
+*.swp
